@@ -1,0 +1,59 @@
+# Local development stack. NOT a production deployment.
+#
+# Note there is no `live` profile and no LIVE mode set anywhere in this
+# file. Running live requires setting the environment variables the config
+# layer validates, deliberately, outside of a convenience compose file.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trading_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_local_only}
+      POSTGRES_DB: trading_agent
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  trading-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Defaults to PAPER via config.py if unset. Override deliberately.
+      TRADING_MODE: ${TRADING_MODE:-PAPER}
+      DATABASE_URL: postgresql+psycopg://trading_agent:${POSTGRES_PASSWORD:-changeme_local_only}@postgres:5432/trading_agent
+      # IBKR TWS/Gateway runs on the host, not in a container.
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      IBKR_PORT: ${IBKR_PORT:-7497}
+      LOG_FORMAT: json
+    # Bound to localhost only: the dashboard has no authentication.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "-m", "trading_agent", "dashboard", "--host", "0.0.0.0"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:

@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Example event",
+    "category": "CLIMATE",
+    "description": "A hedged, uncertain note about what you're tracking.",
+    "stance": "MIXED_UNCERTAIN",
+    "affected_sectors": [
+      "AGRICULTURE"
+    ],
+    "affected_symbols": [],
+    "confidence": 0.4,
+    "source": "Where you read this",
+    "as_of": "2026-08-17",
+    "expires_at": "2026-11-15"
+  }
+]

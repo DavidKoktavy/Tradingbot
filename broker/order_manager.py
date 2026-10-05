@@ -24,11 +24,22 @@ Design decisions:
 - **Cancellation is requested, not asserted.** `cancel()` moves to
   CANCEL_REQUESTED; only a broker confirmation moves it to CANCELLED. A
   cancel can lose the race with a fill.
+
+- **Protective exits are submitted with the entry, as a bracket.** When an
+  intent carries `stop_loss` / `take_profit`, those are sent to IBKR as
+  child orders attached to the parent (`parentId`, `transmit=False` on all
+  but the last, one OCA group so a fill on one cancels the other). Before
+  this, the two fields were used only to size the position and never
+  reached the broker at all: the risk model believed downside was bounded
+  while the live position was in fact unprotected the moment this process
+  stopped running. Protection that only exists in our own memory is not
+  protection.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -111,13 +122,91 @@ def _to_ib_order(order: Order) -> Any:
     return ib_order
 
 
+def _to_ib_bracket(order: Order, next_id: Callable[[], int]) -> list[Any]:
+    """Build parent + protective children for an order carrying exits.
+
+    IBKR's contract for a bracket is specific and unforgiving:
+
+    - every child carries `parentId` equal to the parent's `orderId`, so
+      the parent's id must be assigned by us up front rather than left for
+      the API to fill in;
+    - `transmit=False` on every order but the last holds the whole group
+      at the broker until it is complete, so there is no window in which
+      an entry is live without its stop;
+    - the children share one `ocaGroup` with `ocaType=1`, so whichever
+      exit fills cancels the other instead of leaving a stray order that
+      would reverse the position.
+
+    Returns the orders in submission order. If the intent carries no exits
+    this returns just the parent, with `transmit` left True.
+    """
+    from ib_async import LimitOrder, StopOrder
+
+    intent = order.intent
+    parent = _to_ib_order(order)
+    parent.orderId = next_id()
+    parent.transmit = False
+
+    # A protective exit is the opposite side of the entry.
+    exit_action = "SELL" if intent.side is OrderSide.BUY else "BUY"
+    quantity = float(intent.quantity)
+    oca_group = f"oca-{order.order_id}"
+
+    children: list[Any] = []
+    if intent.take_profit is not None:
+        children.append(LimitOrder(exit_action, quantity, float(intent.take_profit)))
+    if intent.stop_loss is not None:
+        children.append(StopOrder(exit_action, quantity, float(intent.stop_loss)))
+
+    if not children:
+        # Nothing to bracket: send the parent on its own, and let it go.
+        parent.transmit = True
+        return [parent]
+
+    for i, child in enumerate(children):
+        child.orderId = next_id()
+        child.parentId = parent.orderId
+        child.orderRef = order.order_id
+        child.tif = intent.time_in_force.value
+        child.ocaGroup = oca_group
+        child.ocaType = 1
+        # Only the final order in the group transmits; that submission
+        # releases the parent and every sibling atomically.
+        child.transmit = i == len(children) - 1
+
+    return [parent, *children]
+
+
 class IBKROrderGateway(BrokerOrderGateway):
     """Real IBKR gateway. The ib_async calls are isolated here so every
     layer above is testable against the simulated gateway."""
 
-    def __init__(self, ib: IBLike) -> None:
+    def __init__(self, ib: IBLike, *, use_brackets: bool = True) -> None:
         self._ib = ib
         self._trades: dict[str, Any] = {}
+        # Children keyed by the parent's broker id, so cancelling an entry
+        # also withdraws the exits that were waiting on it.
+        self._child_trades: dict[str, list[Any]] = {}
+        self._use_brackets = use_brackets
+
+    def _next_order_id(self) -> int:
+        """Reserve the next client order id.
+
+        ib_async tracks this on the client because IBKR requires ids to be
+        monotonic per session; we must not invent our own numbering.
+        """
+        getter = getattr(self._ib, "client", None)
+        if getter is not None:
+            get_req_id = getattr(getter, "getReqId", None)
+            if callable(get_req_id):
+                return int(get_req_id())
+        direct = getattr(self._ib, "getReqId", None)
+        if callable(direct):
+            return int(direct())
+        raise OrderSubmissionError(
+            "Cannot allocate an order id: the IB client exposes no getReqId(). "
+            "Bracket orders need ids assigned up front for parentId linkage."
+        )
 
     async def place(self, order: Order) -> str:
         from ib_async import Stock
@@ -128,11 +217,36 @@ class IBKROrderGateway(BrokerOrderGateway):
         if not qualified:
             raise OrderSubmissionError(f"Could not qualify contract for {instrument}")
 
-        trade = self._ib.placeOrder(qualified[0], _to_ib_order(order))
-        broker_id = str(getattr(trade.order, "orderId", "") or "")
+        intent = order.intent
+        wants_bracket = intent.stop_loss is not None or intent.take_profit is not None
+
+        if not (self._use_brackets and wants_bracket):
+            trade = self._ib.placeOrder(qualified[0], _to_ib_order(order))
+            broker_id = str(getattr(trade.order, "orderId", "") or "")
+            if not broker_id:
+                raise OrderSubmissionError("Broker returned no order id")
+            self._trades[broker_id] = trade
+            return broker_id
+
+        ib_orders = _to_ib_bracket(order, self._next_order_id)
+        trades = [self._ib.placeOrder(qualified[0], ib_order) for ib_order in ib_orders]
+
+        parent_trade = trades[0]
+        broker_id = str(getattr(parent_trade.order, "orderId", "") or "")
         if not broker_id:
             raise OrderSubmissionError("Broker returned no order id")
-        self._trades[broker_id] = trade
+        self._trades[broker_id] = parent_trade
+        self._child_trades[broker_id] = trades[1:]
+        log.info(
+            "order.bracket_placed",
+            order_id=order.order_id,
+            broker_order_id=broker_id,
+            children=len(trades) - 1,
+            stop_loss=str(intent.stop_loss) if intent.stop_loss is not None else None,
+            take_profit=(
+                str(intent.take_profit) if intent.take_profit is not None else None
+            ),
+        )
         return broker_id
 
     async def cancel(self, broker_order_id: str) -> None:
@@ -140,6 +254,19 @@ class IBKROrderGateway(BrokerOrderGateway):
         if trade is None:
             raise OrderSubmissionError(f"No known broker order {broker_order_id}")
         self._ib.cancelOrder(trade.order)
+        # Cancel the children too. A bracket whose parent is gone but whose
+        # stop is still working would, if it triggered, open a position in
+        # the opposite direction with nothing to close it.
+        for child in self._child_trades.get(broker_order_id, []):
+            try:
+                self._ib.cancelOrder(child.order)
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "order.child_cancel_failed",
+                    broker_order_id=broker_order_id,
+                    child_order_id=getattr(child.order, "orderId", None),
+                    error=str(exc),
+                )
 
     async def open_orders(self) -> list[Any]:
         return await self._ib.reqOpenOrdersAsync()

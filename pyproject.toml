@@ -22,6 +22,9 @@ dependencies = [
     # maintainer passed away in early 2024. ib_insync is unmaintained;
     # ib_async is API-compatible and used as a drop-in replacement.
     "ib_async>=2.1.0",
+    # Real exchange sessions: DST, holidays and early closes. The fixed
+    # UTC window this replaces was silently wrong for most of the year.
+    "exchange_calendars>=4.5",
 ]
 
 [project.optional-dependencies]

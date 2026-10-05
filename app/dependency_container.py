@@ -126,6 +126,19 @@ def build_container(
     instruments = [Instrument(symbol=s.upper()) for s in (symbols or ["SPY"])]
 
     portfolio = PortfolioManager()
+
+    # Restore the day's loss baseline BEFORE the first update_account(),
+    # which would otherwise set it from current equity and silently hand
+    # back any loss already taken today. Never allowed to block startup:
+    # the fallback is simply the pre-restore behaviour.
+    if repository is not None:
+        try:
+            persisted = repository.first_equity_of_day()
+            if persisted is not None:
+                portfolio.restore_session_baseline(persisted)
+        except Exception as exc:  # noqa: BLE001
+            log.error("container.baseline_restore_failed", error=str(exc))
+
     portfolio.update_account(
         AccountState(
             equity=initial_equity, cash=initial_equity, buying_power=initial_equity

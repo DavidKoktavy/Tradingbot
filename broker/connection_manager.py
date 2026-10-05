@@ -18,10 +18,21 @@ Design decisions:
   forever: after `max_reconnect_attempts` we surface the failure so a
   supervising component can halt trading and alert an operator, per the
   fail-closed principle. We do not auto-retry indefinitely in silence.
+- `persistent_reconnect` (opt-in, default off) adds a *second*, slower
+  phase after that budget is exhausted, for always-on deployments. IBKR
+  restarts TWS / IB Gateway once a day, which is longer than any sensible
+  fast-retry budget: without this, a bot left running overnight is simply
+  dead by morning with no position monitoring at all. The important part is
+  that this changes recovery only, never risk: trading is already halted by
+  `on_disconnect` before the first retry, and resumes only via the
+  `on_reconnect` callback, which re-runs the caller's own readiness checks.
+  It stays off by default so the fail-closed, surface-the-error behaviour
+  remains what you get unless you deliberately ask for a daemon.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
@@ -70,6 +81,10 @@ class ConnectionManager:
         client_id: int,
         max_reconnect_attempts: int = 5,
         on_disconnect: Callable[[], Awaitable[None]] | None = None,
+        on_reconnect: Callable[[], Awaitable[None]] | None = None,
+        persistent_reconnect: bool = False,
+        persistent_reconnect_base_delay: float = 5.0,
+        persistent_reconnect_max_delay: float = 300.0,
     ) -> None:
         self._ib = ib
         self._host = host
@@ -77,6 +92,11 @@ class ConnectionManager:
         self._client_id = client_id
         self._max_reconnect_attempts = max_reconnect_attempts
         self._on_disconnect = on_disconnect
+        self._on_reconnect = on_reconnect
+        self._persistent_reconnect = persistent_reconnect
+        self._persistent_base_delay = persistent_reconnect_base_delay
+        self._persistent_max_delay = persistent_reconnect_max_delay
+        self._stop_reconnecting = False
         self._state = ConnectionState.DISCONNECTED
 
         # ib_async events support += for subscribing a callback.
@@ -128,8 +148,14 @@ class ConnectionManager:
 
     async def disconnect(self) -> None:
         log.info("ibkr.disconnecting")
+        self._stop_reconnecting = True
         self._ib.disconnect()
         self._state = ConnectionState.DISCONNECTED
+
+    def stop_reconnecting(self) -> None:
+        """Abandon any persistent reconnect loop. Called on shutdown so the
+        process can actually exit rather than retrying into the void."""
+        self._stop_reconnecting = True
 
     async def _handle_unexpected_disconnect(self, *_args: object) -> None:
         """Callback wired to ib_async's disconnectedEvent. Fires on any
@@ -140,6 +166,7 @@ class ConnectionManager:
 
         log.warning("ibkr.unexpected_disconnect")
         self._state = ConnectionState.RECONNECTING
+        self._stop_reconnecting = False
         if self._on_disconnect is not None:
             # Let the caller (e.g. the control loop / health monitor) stop
             # new trading immediately, before we even attempt to reconnect.
@@ -148,6 +175,65 @@ class ConnectionManager:
             await self.connect()
         except IBConnectionError:
             # State is already DISCONNECTED at this point (set in connect()).
-            # We do not loop forever here — the caller's health check /
-            # supervisor is responsible for deciding what happens next.
             log.error("ibkr.reconnect_exhausted")
+            if self._persistent_reconnect:
+                await self._persistent_reconnect_loop()
+            # Otherwise we do not loop forever — the caller's health check /
+            # supervisor decides what happens next.
+            return
+        await self._notify_reconnected()
+
+    async def _notify_reconnected(self) -> None:
+        if self._on_reconnect is None:
+            return
+        try:
+            await self._on_reconnect()
+        except Exception as exc:  # noqa: BLE001
+            # A failed readiness callback must not be mistaken for a
+            # successful recovery, but neither should it kill the manager.
+            log.error("ibkr.on_reconnect_failed", error=str(exc))
+
+    async def _persistent_reconnect_loop(self) -> None:
+        """Slow, indefinite reconnection for always-on operation.
+
+        Only reached when `persistent_reconnect=True` and the fast budget
+        is already spent. Trading stays halted throughout — this restores
+        the *connection*, and the `on_reconnect` callback is what decides
+        whether trading may resume. Backoff is capped so a long outage
+        settles into a steady, quiet poll rather than either hammering the
+        gateway or drifting into hour-long gaps.
+        """
+        delay = self._persistent_base_delay
+        attempt = 0
+        log.warning(
+            "ibkr.persistent_reconnect_started",
+            base_delay=self._persistent_base_delay,
+            max_delay=self._persistent_max_delay,
+        )
+        while not self._stop_reconnecting:
+            attempt += 1
+            await asyncio.sleep(delay)
+            if self._stop_reconnecting:
+                break
+            self._state = ConnectionState.RECONNECTING
+            try:
+                await self._ib.connectAsync(
+                    self._host, self._port, clientId=self._client_id, timeout=4.0
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "ibkr.persistent_reconnect_attempt_failed",
+                    attempt=attempt,
+                    delay=delay,
+                    error=str(exc),
+                )
+                self._state = ConnectionState.DISCONNECTED
+                delay = min(delay * 2, self._persistent_max_delay)
+                continue
+
+            self._state = ConnectionState.CONNECTED
+            log.info("ibkr.persistent_reconnect_succeeded", attempts=attempt)
+            await self._notify_reconnected()
+            return
+
+        log.info("ibkr.persistent_reconnect_stopped", attempts=attempt)

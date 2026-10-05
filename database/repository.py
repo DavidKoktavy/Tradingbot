@@ -25,7 +25,7 @@ Design decisions:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterator
 
@@ -366,6 +366,41 @@ class Repository:
             )
 
         return self._safe_write("save_account_snapshot", write)
+
+    def first_equity_of_day(self, *, day: date | None = None) -> Decimal | None:
+        """Earliest recorded equity for `day` (UTC), or None.
+
+        This exists so a restart cannot hand the day's loss budget back.
+        The daily-loss limit is measured against start-of-day equity; a
+        process that restarts mid-session and takes its *current* equity as
+        the baseline forgets everything already lost that day, and a system
+        that has hit its loss limit would happily keep trading. Reading the
+        first snapshot of the day back from the database makes the limit
+        survive restarts, which is the only version of the limit worth
+        having.
+
+        Returns None rather than raising: an unreadable database must not
+        prevent startup, and the caller falls back to live equity.
+        """
+        target = day or datetime.now(timezone.utc).date()
+        start = datetime.combine(target, time.min, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        try:
+            with self.session() as session:
+                row = session.scalars(
+                    select(AccountSnapshotRow)
+                    .where(AccountSnapshotRow.trading_mode == self._mode)
+                    .where(AccountSnapshotRow.timestamp >= start)
+                    .where(AccountSnapshotRow.timestamp < end)
+                    .order_by(AccountSnapshotRow.timestamp)
+                    .limit(1)
+                ).first()
+            if row is None:
+                return None
+            return Decimal(str(row.equity))
+        except Exception as exc:  # noqa: BLE001
+            log.error("repository.first_equity_of_day_failed", error=str(exc))
+            return None
 
     def equity_curve(self) -> list[tuple[datetime, Decimal]]:
         try:

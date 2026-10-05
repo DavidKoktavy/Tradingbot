@@ -130,6 +130,7 @@ class RiskEngine:
         session_open: time = time(13, 30),  # 09:30 ET in UTC (standard time)
         session_close: time = time(20, 0),  # 16:00 ET in UTC
         enforce_trading_hours: bool = False,
+        exchange_calendar: object | None = None,
     ) -> None:
         self._limits = limits
         self._portfolio = portfolio
@@ -148,6 +149,10 @@ class RiskEngine:
         self._session_open = session_open
         self._session_close = session_close
         self._enforce_trading_hours = enforce_trading_hours
+        # Optional real exchange calendar. When present it supersedes the
+        # fixed UTC window, which is DST-, holiday- and half-day-blind.
+        # Duck-typed (is_open / describe) so tests can inject a fake.
+        self._calendar = exchange_calendar
         self._peak_equity: Decimal | None = None
 
     @property
@@ -312,6 +317,19 @@ class RiskEngine:
     def _check_trading_hours(self, now: datetime) -> RiskDecision:
         if not self._enforce_trading_hours:
             return RiskDecision.approve("trading_hours", "enforcement disabled")
+
+        # Prefer the real calendar when one is configured: it is the only
+        # version of this check that is correct across DST changes, market
+        # holidays and early closes.
+        if self._calendar is not None:
+            if self._calendar.is_open(now):
+                return RiskDecision.approve("trading_hours")
+            return RiskDecision.reject(
+                "trading_hours",
+                RejectionReason.OUTSIDE_TRADING_HOURS,
+                self._calendar.describe(now),
+            )
+
         if now.weekday() >= 5:
             return RiskDecision.reject(
                 "trading_hours", RejectionReason.OUTSIDE_TRADING_HOURS, "Weekend"
@@ -321,7 +339,9 @@ class RiskEngine:
             return RiskDecision.reject(
                 "trading_hours",
                 RejectionReason.OUTSIDE_TRADING_HOURS,
-                f"{current} outside {self._session_open}-{self._session_close} UTC",
+                f"{current} outside {self._session_open}-{self._session_close} UTC "
+                "(fixed-window fallback: no exchange calendar configured, so "
+                "holidays and half-days are NOT accounted for)",
             )
         return RiskDecision.approve("trading_hours")
 

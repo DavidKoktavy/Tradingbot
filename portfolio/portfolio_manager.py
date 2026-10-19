@@ -105,6 +105,25 @@ class PortfolioManager:
             self._start_of_day_equity = account.equity
             log.info("portfolio.start_of_day_equity_set", equity=str(account.equity))
 
+    def restore_session_baseline(self, equity: Decimal) -> None:
+        """Adopt a persisted start-of-day equity on process start.
+
+        Deliberately distinct from `start_new_session()`, which *rolls* the
+        day and resets the loss budget. This one only fills a baseline that
+        is not yet set, so it can never be used — by code or by an AI
+        suggestion — to hand back a loss budget already spent. If a
+        baseline exists, the call is ignored and logged.
+        """
+        if self._start_of_day_equity is not None:
+            log.info(
+                "portfolio.baseline_restore_ignored",
+                existing=str(self._start_of_day_equity),
+                offered=str(equity),
+            )
+            return
+        self._start_of_day_equity = equity
+        log.info("portfolio.baseline_restored", equity=str(equity))
+
     def start_new_session(self, equity: Decimal) -> None:
         """Explicitly roll the trading day. Called by the scheduler at
         session open — never implicitly on process start."""

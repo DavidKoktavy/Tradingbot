@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project with dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Only rules that catch real bugs (syntax errors, undefined names,
+      # redefinitions). The full ruff/mypy backlog is tracked separately and
+      # is not a gate yet.
+      - name: Lint for real bugs
+        run: ruff check . --select E9,F63,F7,F82,F811 --output-format github
+
+      - name: Run test suite
+        run: pytest -q
+
+      # The replay path exercises strategy -> risk -> order -> fill end to end,
+      # with no broker connection. Unit tests alone have missed bugs here.
+      - name: End-to-end simulation smoke test
+        run: |
+          python -m trading_agent simulate \
+            --data sample_data.csv \
+            --symbols SPY \
+            --strategies ma_crossover \
+            --cycle-seconds 0 | tee sim.log
+          grep -q "Orders submitted: [1-9]" sim.log
+          grep -q "Fills: [1-9]" sim.log

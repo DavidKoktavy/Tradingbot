@@ -167,13 +167,13 @@ def build_container(
     reconciler = Reconciler(order_store, portfolio)
 
     names = strategy_names or ["ma_crossover"]
-    strategies: list[Strategy] = []
+    strategy_list: list[Strategy] = []
     for name in names:
         try:
-            strategies.append(strategy_registry.create(name))
+            strategy_list.append(strategy_registry.create(name))
         except KeyError:
             log.error("container.unknown_strategy", name=name)
-    strategy_engine = StrategyEngine(strategies)
+    strategy_engine = StrategyEngine(strategy_list)
 
     ai_engine = AIDecisionEngine(
         build_ai_provider(settings),

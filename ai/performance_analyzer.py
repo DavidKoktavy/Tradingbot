@@ -26,8 +26,12 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from backtesting.metrics import TradeRecord
+
+if TYPE_CHECKING:
+    from risk.kelly_sizer import KellyStats
 
 
 @dataclass
@@ -44,7 +48,7 @@ class StrategyStats:
     total_commission: float = 0.0
     average_bars_held: float | None = None
 
-    def to_kelly_stats(self) -> "KellyStats | None":
+    def to_kelly_stats(self) -> KellyStats | None:
         """Convert to the narrow shape KellyPositionSizer.update_stats()
         needs. Returns None when there isn't enough information to size
         with at all (no wins/losses recorded yet), matching the

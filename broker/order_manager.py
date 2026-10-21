@@ -269,10 +269,110 @@ class IBKROrderGateway(BrokerOrderGateway):
                 )
 
     async def open_orders(self) -> list[Any]:
-        return await self._ib.reqOpenOrdersAsync()
+        """Open orders in the broker-agnostic shape the reconciler reads.
+
+        ib_async returns its own `Trade` objects. Handing those straight to
+        the reconciler crashed it on the first real open order (it reads
+        `broker_order_id`, `instrument`, ...). The simulated gateway already
+        returned `BrokerOrder`, which is why only a live run exposed this.
+        """
+        trades = await self._ib.reqOpenOrdersAsync()
+        return [ibkr_trade_to_broker_order(t) for t in trades]
 
     async def positions(self) -> list[Any]:
-        return await self._ib.reqPositionsAsync()
+        """Positions in the broker-agnostic shape the reconciler reads.
+        Same reason as `open_orders`: raw ib_async `Position` tuples have
+        no `instrument`/`quantity`/`average_cost`."""
+        raw = await self._ib.reqPositionsAsync()
+        return [ibkr_position_to_broker_position(p) for p in raw]
+
+
+# --- ib_async -> reconciler translation ------------------------------------
+
+# IBKR order status strings -> our state machine. Anything unrecognised maps
+# to ERROR rather than to a state that would look healthy.
+_IB_STATUS_TO_STATE: dict[str, OrderState] = {
+    "ApiPending": OrderState.SUBMITTED,
+    "PendingSubmit": OrderState.SUBMITTED,
+    "ValidationError": OrderState.SUBMITTED,
+    "ApiUpdate": OrderState.ACKNOWLEDGED,
+    "PreSubmitted": OrderState.ACKNOWLEDGED,
+    "Submitted": OrderState.ACKNOWLEDGED,
+    "PendingCancel": OrderState.CANCEL_REQUESTED,
+    "Cancelled": OrderState.CANCELLED,
+    "ApiCancelled": OrderState.CANCELLED,
+    "Filled": OrderState.FILLED,
+    "Inactive": OrderState.REJECTED,
+}
+
+_IB_SECTYPE_TO_ASSET_CLASS = {
+    "STK": "STOCK",
+    "CASH": "FOREX",
+    "FUT": "FUTURE",
+    "OPT": "OPTION",
+    "CRYPTO": "CRYPTO",
+}
+
+
+def _ib_contract_to_instrument(contract: Any) -> Any:
+    """Map an IBKR contract onto the key the rest of the system uses.
+
+    Stocks are always routed SMART by this system, so a stock position is
+    keyed SMART regardless of the listing exchange IBKR reports — otherwise
+    a position the bot itself opened would never match its own record.
+    Anything else keeps its own exchange and is prefixed with its security
+    type, so it can never collide with a stock of the same symbol; such a
+    position is unknown to the bot and will (correctly) halt trading.
+    """
+    from data.models import AssetClass, Instrument
+
+    sec_type = str(getattr(contract, "secType", "") or "STK")
+    symbol = str(getattr(contract, "symbol", "") or getattr(contract, "localSymbol", ""))
+    currency = str(getattr(contract, "currency", "") or "USD")
+
+    if sec_type == "STK":
+        return Instrument(symbol=symbol, exchange="SMART", currency=currency)
+
+    asset = AssetClass(_IB_SECTYPE_TO_ASSET_CLASS.get(sec_type, "STOCK"))
+    local = str(getattr(contract, "localSymbol", "") or symbol)
+    if sec_type not in _IB_SECTYPE_TO_ASSET_CLASS:
+        local = f"{sec_type}:{local}"
+    exchange = str(getattr(contract, "exchange", "") or getattr(contract, "primaryExchange", ""))
+    return Instrument(
+        symbol=local, asset_class=asset, exchange=exchange or "SMART", currency=currency
+    )
+
+
+def ibkr_trade_to_broker_order(trade: Any) -> Any:
+    from execution.reconciliation import BrokerOrder
+
+    order = trade.order
+    status = getattr(trade, "orderStatus", None)
+    status_str = str(getattr(status, "status", "") or "")
+    filled = Decimal(str(getattr(status, "filled", 0) or 0))
+    state = _IB_STATUS_TO_STATE.get(status_str, OrderState.ERROR)
+    if state is OrderState.ACKNOWLEDGED and filled > 0:
+        state = OrderState.PARTIALLY_FILLED
+
+    parent_id = getattr(order, "parentId", 0) or 0
+    return BrokerOrder(
+        broker_order_id=str(order.orderId),
+        instrument=_ib_contract_to_instrument(trade.contract),
+        quantity=Decimal(str(order.totalQuantity)),
+        filled_quantity=filled,
+        state=state,
+        parent_broker_order_id=str(parent_id) if parent_id else None,
+    )
+
+
+def ibkr_position_to_broker_position(position: Any) -> Any:
+    from execution.reconciliation import BrokerPosition
+
+    return BrokerPosition(
+        instrument=_ib_contract_to_instrument(position.contract),
+        quantity=Decimal(str(position.position)),
+        average_cost=Decimal(str(position.avgCost)),
+    )
 
 
 class OrderManager:

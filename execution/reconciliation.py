@@ -57,6 +57,10 @@ class BrokerOrder:
     quantity: Decimal
     filled_quantity: Decimal
     state: OrderState
+    # Set for the protective children of a bracket. They are real orders at
+    # the broker with ids of their own that we never stored, so without this
+    # link every bracket would look like an unknown order and halt trading.
+    parent_broker_order_id: str | None = None
 
 
 @dataclass
@@ -173,6 +177,21 @@ class Reconciler:
 
         for broker_id, bo in broker_by_id.items():
             local = self._orders.get_by_broker_id(broker_id)
+            if (
+                local is None
+                and bo.parent_broker_order_id is not None
+                and self._orders.get_by_broker_id(bo.parent_broker_order_id) is not None
+            ):
+                # A stop or take-profit we attached to one of our own
+                # entries. Accounted for by its parent; not a discrepancy.
+                # A child whose parent we do NOT know still falls through
+                # and halts, exactly like any other unexplained order.
+                log.debug(
+                    "reconcile.bracket_child",
+                    broker_order_id=broker_id,
+                    parent_broker_order_id=bo.parent_broker_order_id,
+                )
+                continue
             if local is None:
                 # An order live at the broker that we don't know about —
                 # e.g. we crashed between submission and persisting the id.

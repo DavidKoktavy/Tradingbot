@@ -50,7 +50,7 @@ trading-agent = "app.cli:main"
 packages = [
     "trading_agent", "app", "broker", "strategies", "ai", "risk",
     "portfolio", "execution", "backtesting", "data", "monitoring",
-    "database",
+    "database", "universe",
 ]
 
 [tool.ruff]

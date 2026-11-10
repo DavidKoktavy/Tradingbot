@@ -49,6 +49,9 @@ class RiskLimits(BaseSettings):
     max_open_positions: int = Field(default=10, gt=0)
     max_orders_per_minute: int = Field(default=20, gt=0)
     max_market_data_age_seconds: float = Field(default=5.0, gt=0)
+    # Long-only by default. New shorts (and adding to shorts) are rejected
+    # by the risk engine unless this is explicitly true. Exits always pass.
+    allow_short_entries: bool = False
 
 
 class IBKRSettings(BaseSettings):

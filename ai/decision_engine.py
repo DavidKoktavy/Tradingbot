@@ -104,6 +104,12 @@ class AIDecisionEngine:
         self._require_stop = require_stop_loss
         self._min_confidence = min_confidence
 
+    def set_allowed_symbols(self, symbols: set[str]) -> None:
+        """Replace the allowed universe when the auto-selector changes it.
+        An empty set means *nothing* is allowed — never "anything", which
+        is what None means — so an empty selection cannot unfence the AI."""
+        self._allowed = {s.upper() for s in symbols}
+
     @property
     def provider_available(self) -> bool:
         return self._provider.is_available

@@ -99,6 +99,13 @@ class MarketDataFeed:
     def history(self, instrument: Instrument) -> list[Bar]:
         return self.bars.get(str(instrument), [])
 
+    async def add_instrument(self, instrument: Instrument) -> None:
+        """In-memory feed: data is injected directly, nothing to subscribe."""
+
+    async def remove_instrument(self, instrument: Instrument) -> None:
+        self.snapshots.pop(str(instrument), None)
+        self.bars.pop(str(instrument), None)
+
 
 class ControlLoop:
     def __init__(
@@ -180,6 +187,40 @@ class ControlLoop:
     def alerts(self) -> AlertManager:
         return self._alerts
 
+    # ---- dynamic universe ---------------------------------------------------
+
+    @property
+    def instruments(self) -> list[Instrument]:
+        return list(self._instruments)
+
+    def add_instrument(self, instrument: Instrument) -> bool:
+        """Start evaluating an instrument from the next cycle. The caller
+        must have its market data subscribed first, or the first cycle
+        that reaches it sets a STALE_MARKET_DATA halt."""
+        if any(str(i) == str(instrument) for i in self._instruments):
+            return False
+        self._instruments = [*self._instruments, instrument]
+        log.info("loop.instrument_added", instrument=str(instrument))
+        return True
+
+    def remove_instrument(self, instrument: Instrument) -> bool:
+        """Stop evaluating an instrument. Refused while it has an open
+        position or a working order: dropping it would leave that exposure
+        with no exit logic and no mark for the risk engine."""
+        key = str(instrument)
+        if not self._portfolio.get_position(instrument).is_flat:
+            log.warning("loop.instrument_remove_refused", instrument=key, reason="open position")
+            return False
+        if any(str(o.intent.instrument) == key for o in self._store.active_orders()):
+            log.warning("loop.instrument_remove_refused", instrument=key, reason="working order")
+            return False
+        before = len(self._instruments)
+        self._instruments = [i for i in self._instruments if str(i) != key]
+        removed = len(self._instruments) < before
+        if removed:
+            log.info("loop.instrument_removed", instrument=key)
+        return removed
+
     @property
     def is_running(self) -> bool:
         return self._running
@@ -248,7 +289,9 @@ class ControlLoop:
                 self.stats.consecutive_failures = 0
                 return
 
-            for instrument in self._instruments:
+            # Iterate a copy: the universe refresher may add or remove
+            # instruments between awaits while this cycle is running.
+            for instrument in list(self._instruments):
                 await self._process_instrument(instrument)
 
             await self._flush_alerts()
@@ -418,6 +461,33 @@ class ControlLoop:
             "intent": intent,
         }
 
+        # Two-step strategy exit. If the position still has protective
+        # bracket orders working at the broker, cancel those first and
+        # defer the exit to a later cycle. Sending both would let the
+        # exit fill and the stop fill afterwards, leaving an unmanaged
+        # short. If the stop fills while the cancel is pending, the
+        # position is flat by the next cycle and no exit is sent at all.
+        if self._risk.is_risk_reducing(intent):
+            gateway = self._orders._gateway  # noqa: SLF001
+            working = gateway.working_protective_orders(intent.instrument)
+            if working:
+                try:
+                    await gateway.cancel_protective_orders(intent.instrument)
+                except Exception as exc:  # noqa: BLE001
+                    log.error(
+                        "loop.protective_cancel_failed",
+                        instrument=str(intent.instrument),
+                        error=str(exc),
+                    )
+                log.info(
+                    "loop.exit_deferred",
+                    instrument=str(intent.instrument),
+                    working_protective_orders=working,
+                    detail="cancelling bracket exits before sending strategy exit",
+                )
+                self._journal_decision(**context, outcome="EXIT_DEFERRED")
+                return
+
         assessment = self._risk.evaluate(intent, snapshot=snapshot, prices=prices)
         if not assessment.approved:
             self.stats.intents_rejected += 1
@@ -513,7 +583,7 @@ class ControlLoop:
 
     def _current_prices(self) -> dict[str, Decimal]:
         prices: dict[str, Decimal] = {}
-        for instrument in self._instruments:
+        for instrument in list(self._instruments):
             snapshot = self._feed.snapshot(instrument)
             if snapshot is not None and snapshot.mid is not None:
                 prices[str(instrument)] = Decimal(str(snapshot.mid))

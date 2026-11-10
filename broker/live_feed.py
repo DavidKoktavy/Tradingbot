@@ -100,6 +100,39 @@ class LiveMarketDataFeed:
             )
         self._warmed_up = True
 
+    async def add_instrument(self, instrument: Instrument) -> None:
+        """Subscribe and warm up one more instrument mid-session. Raises if
+        no history comes back, for the same reason `start()` does; the
+        subscription is undone first so a failed add leaves nothing behind."""
+        key = str(instrument)
+        if any(str(i) == key for i in self._instruments):
+            return
+        await self._provider.subscribe(instrument)
+        try:
+            bars = await self._provider.get_historical_bars(
+                instrument, duration=self._history_duration, bar_size=self._bar_size
+            )
+        except Exception:
+            await self._provider.unsubscribe(instrument)
+            raise
+        if not bars:
+            await self._provider.unsubscribe(instrument)
+            raise RuntimeError(f"No historical bars returned for {instrument}")
+        self._bars[key] = bars[-self._max_bars :]
+        self._instruments = [*self._instruments, instrument]
+        log.info("feed.instrument_added", instrument=key, bars=len(bars))
+
+    async def remove_instrument(self, instrument: Instrument) -> None:
+        key = str(instrument)
+        self._instruments = [i for i in self._instruments if str(i) != key]
+        self._bars.pop(key, None)
+        self._building.pop(key, None)
+        try:
+            await self._provider.unsubscribe(instrument)
+        except Exception as exc:  # noqa: BLE001
+            log.error("feed.unsubscribe_failed", instrument=key, error=str(exc))
+        log.info("feed.instrument_removed", instrument=key)
+
     async def stop(self) -> None:
         for instrument in self._instruments:
             try:
@@ -186,7 +219,7 @@ class LiveMarketDataFeed:
         rate; the snapshot itself is event-driven underneath.
         """
         while True:
-            for instrument in self._instruments:
+            for instrument in list(self._instruments):
                 snapshot = self._provider.get_snapshot(instrument)
                 if snapshot is not None:
                     try:

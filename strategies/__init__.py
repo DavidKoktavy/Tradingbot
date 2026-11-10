@@ -21,6 +21,7 @@ from strategies.base import (
     StrategyContext,
     StrategyParams,
 )
+from strategies.buy_the_dip import BuyTheDipStrategy
 from strategies.ma_crossover import MACrossoverStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.momentum import MomentumStrategy
@@ -28,6 +29,7 @@ from strategies.registry import registry, register_strategy
 from strategies.trend_following import TrendFollowingStrategy
 
 __all__ = [
+    "BuyTheDipStrategy",
     "MACrossoverStrategy",
     "MeanReversionStrategy",
     "MomentumStrategy",

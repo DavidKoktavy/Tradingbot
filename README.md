@@ -40,7 +40,7 @@ independent, explicitly-set environment values checked at startup
 ```bash
 pip install -e ".[dev]"
 cp .env.example .env          # never commit real credentials
-pytest                        # 496 tests, no network required
+pytest                        # no network required
 
 python -m trading_agent status
 python -m trading_agent strategies
@@ -77,6 +77,82 @@ pytest
 | 8 | Paper trading |
 | 9 | Monitoring + dashboard |
 | 10 | Hardening, testing, deployment |
+
+## Automatic stock selection and buy-the-dip notes
+
+The bot can now choose what to trade instead of being told with `--symbols`.
+
+```bash
+# Preview: connects to IBKR, ranks stocks, places NO orders
+python -m trading_agent universe --use-scanner --top-n 5
+
+# Run: pick stocks, buy dips, long only, re-select once a day
+python -m trading_agent paper --auto-universe --use-scanner --top-n 5 \
+    --strategies buy_the_dip --cycle-seconds 5
+```
+
+- **`approved_universe.json` is the boundary.** The IBKR scanner
+  (`--use-scanner`, default scan codes `TOP_PERC_LOSE` and `MOST_ACTIVE`)
+  only *proposes* candidates. Anything it finds that is not on the
+  approved list is logged and ignored, and is never even requested for
+  history. Widening what the bot can trade is a reviewable edit to that
+  file. The shipped list is an example of liquid US large caps, not a
+  recommendation.
+- **Fallbacks never widen the universe.** No scanner permissions, scanner
+  errors, or no approved hits → the whole approved list is scored instead.
+  The reason is printed as `Candidate source:`.
+- **Scoring (`universe/scoring.py`) is deterministic, on daily bars.**
+  Hard filters first: 200+ days of history, price ≥ $5, 20-day average
+  dollar volume ≥ $50M, close above the 200-day SMA. Then a dip score:
+  RSI(2) washout plus pullback from the 20-day high. It is a ranking, not
+  a forecast.
+- **Held stocks are never dropped.** A stock with an open position or a
+  working order stays tracked even after it stops ranking. Otherwise its
+  exit logic would stop running, and the risk engine (correctly) refuses
+  every trade when an open position has no price.
+- **Mid-session changes are ordered for safety.** New stocks are
+  subscribed and warmed up, and must deliver a first quote, *before* the
+  loop sees them. Removed stocks leave the loop *before* being
+  unsubscribed. The reverse order would set a global stale-data halt.
+  The full selection re-runs every `--universe-refresh-minutes`
+  (default 1440); held positions are re-checked every minute, so
+  positions adopted by reconciliation after a restart get tracked.
+- **The AI layer is re-fenced to the current universe**, and an empty
+  universe means "nothing allowed", never "anything".
+- **`buy_the_dip` strategy**: buys when RSI(2) ≤ 10 while the close is
+  above its 200-bar SMA, and exits on the bounce (RSI(2) ≥ 70 or close
+  above the 5-bar SMA) or when the trend breaks (close below the 200-bar
+  SMA). The ATR bracket stop is the hard floor. Unlike `mean_reversion`,
+  it refuses to buy a stock that is below its trend. It never goes short.
+- **Long only by default (`ALLOW_SHORT_ENTRIES=false`).** A new risk check
+  rejects any order that could leave a position short: opening a short,
+  adding to one, or flipping a long through zero. Selling a long and
+  covering an existing short always pass. There is no borrow
+  availability check yet; add one before enabling shorts.
+- **Bug fixed: strategy exits were always rejected.** Exit orders carry
+  no protective stop, so the position sizer refused every one of them,
+  and the rejection was not logged. Positions only ever closed through
+  bracket stop/take-profit children, never on a strategy's FLAT signal.
+  Replaying the same data with `trend_following`: before the fix, 32 exit
+  signals, 0 executed, finishing stuck holding 77 shares; after, 20
+  orders, ending flat. Risk-reducing orders now skip sizing, buying-power
+  and sector checks, all of which treated an exit as added exposure.
+  Every other gate (kill switch, halts, data freshness, price sanity,
+  daily loss, drawdown) still applies. Note: a breached daily-loss or
+  drawdown limit therefore also blocks strategy exits. Broker-side
+  bracket stops still protect the position, but this is a policy worth
+  revisiting.
+- **Strategy exits are two-step when a bracket is working.** Now that
+  strategy exits actually execute, a closed position's bracket stop could
+  still be working at IBKR; if it triggered later it would sell again and
+  open an unmanaged short. So when a position has working protective
+  children, the loop cancels them and defers the exit (`EXIT_DEFERRED` in
+  the journal). It sends the exit only once IBKR reports them done. A
+  child in `PendingCancel` still counts as working, because a cancel can
+  lose the race with a fill. If the stop fills meanwhile, the position is
+  flat and no exit is sent.
+- `--auto-universe` is `paper`-only (it needs IBKR history and the
+  scanner). `simulate` refuses it.
 
 ## Autonomous order submission notes
 

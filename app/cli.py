@@ -246,6 +246,13 @@ def cmd_simulate(args: argparse.Namespace) -> int:
         return 1
     _print_banner(TradingMode.SIMULATION)
     print("SIMULATION mode uses an internal fill simulator; no broker connection is made.")
+    if getattr(args, "auto_universe", False):
+        print(
+            "--auto-universe needs IBKR historical data and the scanner, so it is only "
+            "supported by `paper`. Use `universe` to preview selections.",
+            file=sys.stderr,
+        )
+        return 2
     if not args.data:
         print(
             "No --data file given: there is no market data source, so nothing will "
@@ -735,6 +742,91 @@ def _gateway_and_feed_for_mode(mode: TradingMode, container, args, ibkr_client=N
     return container.gateway, MarketDataFeed()
 
 
+def _build_selector(args: argparse.Namespace, ibkr_client):
+    """Selector over IBKR history, optionally fed by the IBKR scanner."""
+    from broker.scanner import IBKRScanner
+    from universe import ApprovedUniverse, UniverseSelector
+
+    approved = ApprovedUniverse.from_file(args.universe_file)
+    scanner = None
+    if args.use_scanner:
+        scanner = IBKRScanner(ibkr_client._ib, scan_codes=args.scan_codes)  # noqa: SLF001
+    return UniverseSelector(
+        approved,
+        ibkr_client,
+        scanner=scanner,
+        top_n=args.top_n,
+        request_spacing_seconds=0.5,
+    )
+
+
+def _print_selection(selection) -> None:
+    print(f"\nCandidate source: {selection.candidate_source}")
+    if selection.scanner_rejected:
+        shown = ", ".join(selection.scanner_rejected[:10])
+        print(f"Scanner hits not on approved list (ignored): {shown}"
+              f"{' ...' if len(selection.scanner_rejected) > 10 else ''}")
+    ranked = sorted(selection.scored, key=lambda c: (not c.eligible, -c.score, c.symbol))
+    print(f"\n  {'SYMBOL':<7} {'SCORE':>6} {'RSI':>6} {'PULLBK':>7}  STATUS")
+    for c in ranked[:20]:
+        rsi_txt = f"{c.rsi:6.1f}" if c.rsi is not None else "     -"
+        pb_txt = f"{c.pullback_pct:7.1%}" if c.pullback_pct is not None else "      -"
+        status = "PICKED" if c.symbol in selection.selected else (
+            "eligible" if c.eligible else "; ".join(c.reasons)[:60]
+        )
+        hit = "*" if c.scanner_hit else " "
+        print(f"  {c.symbol:<6}{hit} {c.score:6.3f} {rsi_txt} {pb_txt}  {status}")
+    if len(ranked) > 20:
+        print(f"  ... {len(ranked) - 20} more")
+    print(f"\nSelected: {selection.selected or 'nothing eligible'}")
+    if selection.held:
+        print(f"Kept because held: {selection.held}")
+    print()
+
+
+def cmd_universe(args: argparse.Namespace) -> int:
+    """Dry run: connect, select, print. Places no orders and starts no loop."""
+    settings = get_settings()
+    _print_banner(settings.trading_mode)
+
+    async def run() -> int:
+        from broker.ibkr_client import IBKRClient
+        from broker.market_data import MarketDataType
+
+        md_type = MarketDataType[settings.ibkr.market_data_type.upper()]
+        client = IBKRClient(settings.ibkr, market_data_type=md_type)
+        try:
+            selector = _build_selector(args, client)
+        except (OSError, ValueError) as exc:
+            print(f"Could not load approved universe: {exc}", file=sys.stderr)
+            return 1
+        try:
+            await client.connect()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not connect to IBKR: {exc}", file=sys.stderr)
+            return 1
+        try:
+            print(f"Scoring {len(selector.approved)} approved symbols"
+                  f"{' via scanner' if args.use_scanner else ''} (no orders will be placed)...")
+            _print_selection(await selector.select())
+        finally:
+            await client.disconnect()
+        return 0
+
+    return asyncio.run(run())
+
+
+def _add_universe_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--universe-file", default="approved_universe.json",
+                   help="JSON list of symbols the bot may ever trade")
+    p.add_argument("--top-n", type=int, default=5, help="How many stocks to pick")
+    p.add_argument("--use-scanner", action="store_true",
+                   help="Let the IBKR market scanner propose candidates (still limited "
+                        "to the approved list)")
+    p.add_argument("--scan-codes", nargs="+", default=["TOP_PERC_LOSE", "MOST_ACTIVE"],
+                   help="IBKR scan codes used with --use-scanner")
+
+
 def _run_loop(args: argparse.Namespace, mode: TradingMode) -> int:
     from app.control_loop import ControlLoop
 
@@ -743,9 +835,8 @@ def _run_loop(args: argparse.Namespace, mode: TradingMode) -> int:
 
     async def run() -> None:
         nonlocal ibkr_client
-        container = build_container(
-            settings, symbols=args.symbols, strategy_names=args.strategies
-        )
+        selector = None
+        selection = None
 
         if mode is TradingMode.PAPER:
             from broker.ibkr_client import IBKRClient
@@ -767,6 +858,27 @@ def _run_loop(args: argparse.Namespace, mode: TradingMode) -> int:
                     file=sys.stderr,
                 )
                 return
+
+        symbols = args.symbols
+        if getattr(args, "auto_universe", False):
+            if mode is not TradingMode.PAPER:
+                print("--auto-universe is only supported by `paper`.", file=sys.stderr)
+                return
+            try:
+                selector = _build_selector(args, ibkr_client)
+            except (OSError, ValueError) as exc:
+                print(f"\nCould not load approved universe: {exc}", file=sys.stderr)
+                await ibkr_client.disconnect()
+                return
+            print(f"Selecting stocks from {len(selector.approved)} approved symbols"
+                  f"{' (scanner on)' if args.use_scanner else ''}...")
+            selection = await selector.select()
+            _print_selection(selection)
+            symbols = selection.symbols
+
+        container = build_container(
+            settings, symbols=symbols, strategy_names=args.strategies
+        )
 
         gateway, feed = _gateway_and_feed_for_mode(mode, container, args, ibkr_client)
 
@@ -826,13 +938,32 @@ def _run_loop(args: argparse.Namespace, mode: TradingMode) -> int:
         print("Press Ctrl+C to stop.\n")
 
         background = None
+        refresher_task = None
         try:
             if mode is TradingMode.PAPER:
                 background = asyncio.create_task(feed.run_ingest())
+            if selector is not None:
+                from universe.refresher import UniverseRefresher
+
+                refresher = UniverseRefresher(
+                    selector,
+                    loop,
+                    feed,
+                    portfolio=container.portfolio,
+                    order_store=container.order_store,
+                    ai_engine=container.ai_engine,
+                    refresh_seconds=args.universe_refresh_minutes * 60,
+                )
+                refresher.last_selection = selection
+                refresher_task = asyncio.create_task(refresher.run())
+                print(f"Universe refresh every {args.universe_refresh_minutes} min; "
+                      "held positions are always kept.")
             await loop.start(max_cycles=args.max_cycles)
         except KeyboardInterrupt:
             loop.stop()
         finally:
+            if refresher_task is not None:
+                refresher_task.cancel()
             if background is not None:
                 background.cancel()
             if ibkr_client is not None:
@@ -877,6 +1008,13 @@ def build_parser() -> argparse.ArgumentParser:
             "--history-duration", default="2 D",
             help="How much history to warm up strategies with. Only used by `paper`.",
         )
+        p.add_argument(
+            "--auto-universe", action="store_true",
+            help="Pick stocks automatically instead of using --symbols (paper only)",
+        )
+        _add_universe_args(p)
+        p.add_argument("--universe-refresh-minutes", type=float, default=1440,
+                       help="How often to re-run stock selection with --auto-universe")
 
     p = sub.add_parser("status", help="Show system status and health")
     add_common(p)
@@ -930,6 +1068,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("paper", help="Run against an IBKR paper account")
     add_loop_args(p)
     p.set_defaults(func=cmd_paper)
+
+    p = sub.add_parser(
+        "universe", help="Preview automatic stock selection (connects to IBKR, places no orders)"
+    )
+    _add_universe_args(p)
+    p.set_defaults(func=cmd_universe)
 
     p = sub.add_parser("reconcile", help="Compare local state against the broker")
     add_common(p)

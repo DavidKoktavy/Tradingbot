@@ -123,7 +123,12 @@ def build_container(
     repository: object | None = None,
 ) -> Container:
     mode_gate = gate_from_settings(settings)
-    instruments = [Instrument(symbol=s.upper()) for s in (symbols or ["SPY"])]
+    # None -> the historical SPY default. An explicit empty list (an
+    # auto-selected universe with nothing eligible) stays empty rather
+    # than silently trading SPY.
+    instruments = [
+        Instrument(symbol=s.upper()) for s in (["SPY"] if symbols is None else symbols)
+    ]
 
     portfolio = PortfolioManager()
 
@@ -179,6 +184,8 @@ def build_container(
         build_ai_provider(settings),
         allowed_symbols={i.symbol for i in instruments},
     )
+    if not instruments:
+        ai_engine.set_allowed_symbols(set())
 
     metrics = MetricsRegistry()
     alerts = AlertManager([LogNotificationProvider()])

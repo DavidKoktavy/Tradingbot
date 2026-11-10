@@ -1,0 +1,12 @@
+{
+  "_comment": "Symbols the bot may EVER trade with --auto-universe. The IBKR scanner can only propose names from this list; anything else it finds is ignored. Example starter list of liquid US large caps, not a recommendation. Edit it deliberately and commit the change.",
+  "symbols": [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "ORCL", "AMD",
+    "ADBE", "CRM", "CSCO", "INTC", "QCOM", "TXN", "IBM", "NFLX",
+    "JPM", "BAC", "GS", "MS", "V", "MA",
+    "UNH", "LLY", "JNJ", "ABBV", "MRK", "PFE", "AMGN", "TMO", "DHR",
+    "XOM", "CVX",
+    "PG", "KO", "PEP", "WMT", "COST", "HD", "LOW", "MCD", "SBUX", "NKE", "DIS",
+    "CAT", "HON", "GE", "UNP", "LIN"
+  ]
+}

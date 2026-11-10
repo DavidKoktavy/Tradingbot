@@ -65,6 +65,7 @@ class RiskEngineLimits:
         "max_spread_pct",
         "price_sanity_band_pct",
         "target_sanity_band_pct",
+        "allow_short_entries",
     )
 
     def __init__(
@@ -81,6 +82,7 @@ class RiskEngineLimits:
         max_spread_pct: Decimal = Decimal("0.01"),
         price_sanity_band_pct: Decimal = Decimal("0.10"),
         target_sanity_band_pct: Decimal = Decimal("0.50"),
+        allow_short_entries: bool = False,
     ) -> None:
         object.__setattr__(self, "max_risk_per_trade", Decimal(str(max_risk_per_trade)))
         object.__setattr__(self, "max_daily_loss", Decimal(str(max_daily_loss)))
@@ -97,6 +99,10 @@ class RiskEngineLimits:
         object.__setattr__(
             self, "target_sanity_band_pct", Decimal(str(target_sanity_band_pct))
         )
+        # Fail closed: opening or adding to a short is refused unless the
+        # operator explicitly enabled it. Covering an existing short and
+        # selling down a long are never affected by this flag.
+        object.__setattr__(self, "allow_short_entries", bool(allow_short_entries))
 
     @classmethod
     def from_config(cls, risk_limits: object) -> "RiskEngineLimits":
@@ -113,6 +119,7 @@ class RiskEngineLimits:
             max_market_data_age_seconds=float(
                 getattr(risk_limits, "max_market_data_age_seconds")
             ),
+            allow_short_entries=bool(getattr(risk_limits, "allow_short_entries", False)),
         )
 
 
@@ -208,6 +215,7 @@ class RiskEngine:
                 lambda: self._check_kill_switch(),
                 lambda: self._check_halt(),
                 lambda: self._check_intent_sanity(intent),
+                lambda: self._check_short_entry(intent),
                 lambda: self._check_trading_hours(now),
                 lambda: self._check_rate_limit(now),
                 lambda: self._check_market_data(intent, snapshot, now),
@@ -233,25 +241,54 @@ class RiskEngine:
                     )
                     return assessment
 
-            # Sizing runs after the gates: no point sizing a trade that
-            # was never going to be allowed.
-            sized = self._size(intent, snapshot, atr)
-            assessment.decisions.append(sized[0])
-            if not sized[0].approved:
-                assessment.approved = False
-                return assessment
-            quantity = sized[1]
+            # A risk-reducing order (selling at most the existing long, or
+            # buying back at most the existing short) is not sized: sizing
+            # answers "how much new risk may this trade add", and an exit
+            # adds none. Exits carry no protective stop, so the sizer used
+            # to refuse every one of them — strategy FLAT signals could
+            # never close a position. The buying-power and sector checks
+            # are skipped for the same reason: both treat the quantity as
+            # added exposure. Every gate above still applies to exits.
+            reducing = self._is_risk_reducing(intent)
+            if reducing:
+                quantity = intent.quantity
+                assessment.decisions.append(
+                    RiskDecision.approve(
+                        "position_sizing", f"risk-reducing exit of {quantity}; not sized"
+                    )
+                )
+            else:
+                # Sizing runs after the gates: no point sizing a trade that
+                # was never going to be allowed.
+                sized = self._size(intent, snapshot, atr)
+                assessment.decisions.append(sized[0])
+                if not sized[0].approved:
+                    assessment.approved = False
+                    log.warning(
+                        "risk.rejected",
+                        intent_id=intent.intent_id,
+                        check=sized[0].check_name,
+                        reason=sized[0].reason,
+                        detail=sized[0].detail,
+                        source=intent.source,
+                    )
+                    return assessment
+                quantity = sized[1]
 
             # Post-sizing limit checks, using the sized quantity.
             reference_price = self._reference_price(intent, snapshot)
-            for check in (
+            post_checks = [
                 lambda: self._check_position_size(intent, quantity, reference_price),
                 lambda: self._check_gross_exposure(intent, quantity, reference_price, prices),
-                lambda: self._check_buying_power(quantity, reference_price),
-                lambda: self._check_sector_and_correlation(
-                    intent, quantity, reference_price, prices
-                ),
-            ):
+            ]
+            if not reducing:
+                post_checks += [
+                    lambda: self._check_buying_power(quantity, reference_price),
+                    lambda: self._check_sector_and_correlation(
+                        intent, quantity, reference_price, prices
+                    ),
+                ]
+            for check in post_checks:
                 decision = check()
                 assessment.decisions.append(decision)
                 if not decision.approved:
@@ -313,6 +350,43 @@ class RiskEngine:
                 "intent_sanity", RejectionReason.ZERO_QUANTITY, "Quantity must be positive"
             )
         return RiskDecision.approve("intent_sanity")
+
+    def is_risk_reducing(self, intent: OrderIntent) -> bool:
+        """True if the intent only shrinks an existing position."""
+        return self._is_risk_reducing(intent)
+
+    def _is_risk_reducing(self, intent: OrderIntent) -> bool:
+        existing = self._portfolio.get_position(intent.instrument).quantity
+        if intent.side is OrderSide.SELL:
+            return existing > 0 and intent.quantity <= existing
+        return existing < 0 and intent.quantity <= -existing
+
+    def _check_short_entry(self, intent: OrderIntent) -> RiskDecision:
+        """Long-only gate. Rejects any order that could leave the position
+        short (opening a short, adding to one, or flipping a long through
+        zero). Uses the *requested* quantity: the sizer only ever reduces
+        it, so if the requested quantity cannot create a short, the sized
+        one cannot either.
+
+        Exits are deliberately unaffected: selling exactly the long, or
+        buying to cover a short that already exists, both pass. A gate that
+        blocked exits would strand positions with no way out — the same
+        failure mode the price-sanity check once had.
+        """
+        if self._limits.allow_short_entries:
+            return RiskDecision.approve("short_entry", "short entries enabled")
+        if intent.side is not OrderSide.SELL:
+            return RiskDecision.approve("short_entry")
+        existing = self._portfolio.get_position(intent.instrument).quantity
+        projected = existing - intent.quantity
+        if projected < 0 and projected < min(existing, Decimal("0")):
+            return RiskDecision.reject(
+                "short_entry",
+                RejectionReason.SHORT_SELLING_DISABLED,
+                f"SELL {intent.quantity} against position {existing} would leave "
+                f"{projected} (short entries disabled; set ALLOW_SHORT_ENTRIES=true)",
+            )
+        return RiskDecision.approve("short_entry")
 
     def _check_trading_hours(self, now: datetime) -> RiskDecision:
         if not self._enforce_trading_hours:

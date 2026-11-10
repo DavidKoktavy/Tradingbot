@@ -80,6 +80,15 @@ class BrokerOrderGateway(ABC):
     @abstractmethod
     async def positions(self) -> list[Any]: ...
 
+    def working_protective_orders(self, instrument: Any) -> int:
+        """Broker-side protective exits (bracket children) still able to
+        fill for this instrument. Gateways without brackets have none."""
+        return 0
+
+    async def cancel_protective_orders(self, instrument: Any) -> int:
+        """Request cancellation of those exits. Returns how many were asked."""
+        return 0
+
 
 class IBLike(Protocol):
     def placeOrder(self, contract: Any, order: Any) -> Any: ...
@@ -187,6 +196,7 @@ class IBKROrderGateway(BrokerOrderGateway):
         # Children keyed by the parent's broker id, so cancelling an entry
         # also withdraws the exits that were waiting on it.
         self._child_trades: dict[str, list[Any]] = {}
+        self._child_instrument: dict[str, str] = {}
         self._use_brackets = use_brackets
 
     def _next_order_id(self) -> int:
@@ -237,6 +247,7 @@ class IBKROrderGateway(BrokerOrderGateway):
             raise OrderSubmissionError("Broker returned no order id")
         self._trades[broker_id] = parent_trade
         self._child_trades[broker_id] = trades[1:]
+        self._child_instrument[broker_id] = str(instrument)
         log.info(
             "order.bracket_placed",
             order_id=order.order_id,
@@ -267,6 +278,52 @@ class IBKROrderGateway(BrokerOrderGateway):
                     child_order_id=getattr(child.order, "orderId", None),
                     error=str(exc),
                 )
+
+    # ---- protective children vs strategy exits ---------------------------
+
+    # A child is "working" until IBKR reports a terminal state. Not
+    # ib_async's Trade.isActive(): that returns False for PendingCancel,
+    # and a pending cancel can still lose the race with a fill.
+    _DONE_STATES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
+
+    def _working_children(self, instrument: Any) -> list[Any]:
+        key = str(instrument)
+        working: list[Any] = []
+        for parent_id, children in self._child_trades.items():
+            if self._child_instrument.get(parent_id) != key:
+                continue
+            for child in children:
+                status = getattr(getattr(child, "orderStatus", None), "status", None)
+                if status not in self._DONE_STATES:
+                    working.append(child)
+        return working
+
+    def working_protective_orders(self, instrument: Any) -> int:
+        return len(self._working_children(instrument))
+
+    async def cancel_protective_orders(self, instrument: Any) -> int:
+        """Withdraw a position's bracket stop/take-profit before a strategy
+        exit is sent. Without this, the exit closes the position while the
+        stop keeps working at IBKR; if it later triggers it sells again and
+        opens a short that nothing in this process is managing."""
+        children = self._working_children(instrument)
+        for child in children:
+            try:
+                self._ib.cancelOrder(child.order)
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "order.child_cancel_failed",
+                    instrument=str(instrument),
+                    child_order_id=getattr(child.order, "orderId", None),
+                    error=str(exc),
+                )
+        if children:
+            log.info(
+                "order.protective_cancel_requested",
+                instrument=str(instrument),
+                count=len(children),
+            )
+        return len(children)
 
     async def open_orders(self) -> list[Any]:
         """Open orders in the broker-agnostic shape the reconciler reads.
